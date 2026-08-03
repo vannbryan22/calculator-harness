@@ -119,6 +119,17 @@ function inferNeededTool(
   return null;
 }
 
+// Canonical key for a tool call's arguments: JSON with sorted top-level keys,
+// so {"expression":"5*5"} and an equivalently-shaped re-call collide. Used to
+// detect a tool call whose result is ALREADY KNOWN (don't redo known work).
+function canonicalArgsKey(args: Record<string, any>): string {
+  const sorted: Record<string, any> = {};
+  for (const k of Object.keys(args).sort()) {
+    sorted[k] = args[k];
+  }
+  return JSON.stringify(sorted);
+}
+
 async function runHarness() {
   let toolDescriptions = toolRegistry
     .map((tool) => `- ${tool.name}: ${tool.description}`)
@@ -162,6 +173,14 @@ async function runHarness() {
 
   messages = [{ role: "system", content: systemPrompt }];
 
+  // Session-wide cache of tool results keyed by `${name}:${canonicalArgs}`.
+  // Lets us detect a redundant tool call whose result is ALREADY KNOWN — for
+  // example a follow-up turn where the model scrapes an old tool call from
+  // conversation history and re-runs it. Scoped to the whole session so it
+  // survives across turns; exact-args keyed so a genuinely new call is never
+  // wrongly blocked.
+  const seenToolResults = new Map<string, string>();
+
   while (true) {
     const userInput = prompt("You: ");
     const trimmed = (userInput ?? "").trim();
@@ -193,9 +212,6 @@ async function runHarness() {
     // Track which tools have actually executed for THIS user request, so we
     // can directive-rescue a stuck model (and not re-suggest a done tool).
     const usedTools: string[] = [];
-    // Track the most recent tool call (name + serialized args) so we can detect
-    // a model spinning on the same call repeatedly (e.g. calculator("-1235")).
-    let lastToolCall = "";
     // Track the last assistant thought so we can detect a thought-only loop
     // (model emits only "thought" and repeats itself without ever acting).
     let lastThought = "";
@@ -266,30 +282,31 @@ async function runHarness() {
           );
 
           if (selectedTool) {
-            // --- NO-OP / DUPLICATE TOOL CALL GUARD ---
-            // A small model often re-invokes a tool with a value it already
-            // has (e.g. calculator("-1235") after the calculator already
-            // returned -1235). That's a no-op: there's nothing left to compute,
-            // so force the model to draft its answer instead of looping.
-            const callSig = `${selectedTool.name}:${JSON.stringify(parsed.tool_arguments)}`;
+            // --- REDUNDANT TOOL CALL GUARD (session-wide) ---
+            // If we've ALREADY successfully run this exact (name, args) call
+            // earlier in the session, do NOT re-run it. This is what stops a
+            // small model from scraping an old tool call out of conversation
+            // history and re-executing it on a follow-up turn (e.g. re-running
+            // calculator("98765 - 100000") when its result is already known).
+            // It also covers the bare-number no-op (calculator("-1235")).
+            const callKey = `${selectedTool.name}:${canonicalArgsKey(parsed.tool_arguments)}`;
+            const cached = seenToolResults.get(callKey);
             const isBareNumberCalc =
               selectedTool.name === "calculator" &&
               /^\s*-?\d+(\.\d+)?\s*$/.test(
                 String(parsed.tool_arguments?.expression ?? ""),
               );
-            const isDuplicate = callSig === lastToolCall;
-            lastToolCall = callSig;
 
-            if (isBareNumberCalc || isDuplicate) {
+            if (cached !== undefined || isBareNumberCalc) {
               console.log(
-                `❌ Harness Error: Model re-called "${selectedTool.name}" with no new work to do (duplicate/no-op). Forcing a draft.`,
+                `❌ Harness Error: "${selectedTool.name}" was already called with these arguments${cached !== undefined ? ` (result: ${cached})` : ""}. Not re-running — answer the user's CURRENT message.`,
               );
               if (!usedTools.includes(selectedTool.name)) {
                 usedTools.push(selectedTool.name);
               }
               messages.push({
                 role: "user",
-                content: `You just tried to call the "${selectedTool.name}" tool again, but there is nothing new to compute — you already have the result you need.\n\nSTOP calling tools. You MUST now write a "draft_answer" that answers the user's FULL question. Use this exact template:\n"The exact result is [insert the number you got], which is a [positive/negative] number."\n\nOutput the JSON now with tool_name=null, a draft_answer, critique="APPROVED ...", and final_answer.`,
+                content: `You just called "${selectedTool.name}" again with arguments you've already used${cached !== undefined ? ` and already got the result: ${cached}` : " (a bare number with nothing to compute)"}. Re-running it will not help.\n\nLook at the user's LATEST message and respond to THAT. If you already have every piece of information it needs, STOP calling tools and write a "draft_answer" that directly answers what the user just asked. If it needs genuinely new information, call a tool with DIFFERENT arguments.\n\nOutput the JSON now.`,
               });
               continue;
             }
@@ -303,6 +320,9 @@ async function runHarness() {
             try {
               const result = await selectedTool.execute(parsed.tool_arguments);
               console.log(`[Tool Result: ${result}]`);
+
+              // Cache the successful result so a later identical call is caught.
+              seenToolResults.set(callKey, String(result));
 
               // Directive nudge: if the user's request still needs a tool we
               // haven't run, point at it. Otherwise force a draft_answer now
@@ -453,7 +473,11 @@ async function runHarness() {
             parsed.thought.trim() === lastThought.trim();
           lastThought = parsed.thought;
 
-          // What's the next concrete step?
+          // What's the next concrete step? inferNeededTool looks at the user's
+          // request and which tools have already run THIS turn. When it returns
+          // null there's no remaining tool to suggest — so we steer to a draft.
+          // This is fully general: it handles greetings, follow-ups, and
+          // "tools already done" through the same path, no word-matching.
           const needed = inferNeededTool(userInput, usedTools);
 
           if (repeating || attempts >= 3) {
@@ -465,11 +489,10 @@ async function runHarness() {
                   ? JSON.stringify(needed.args)
                   : `<fill in arguments for ${needed.name}>`;
               skeleton = `{"thought": "${parsed.thought.replace(/"/g, "'")} I will call the ${needed.name} tool now.", "tool_name": "${needed.name}", "tool_arguments": ${argHint}, "draft_answer": null, "critique": null, "final_answer": null}`;
-            } else if (usedTools.length > 0) {
-              // Tools are done but it won't draft an answer -> give the draft skeleton.
-              skeleton = `{"thought": "All tools are done. I will write my final answer now.", "tool_name": null, "tool_arguments": {}, "draft_answer": "The exact result is [insert number], which is a [positive/negative] number.", "critique": "APPROVED. The draft states the result and whether it is positive or negative.", "final_answer": "The exact result is [insert number], which is a [positive/negative] number."}`;
             } else {
-              skeleton = `{"thought": "I will take an action now.", "tool_name": "<pick one: calculator, read_file, write_file, or null>", "tool_arguments": {}, "draft_answer": null, "critique": null, "final_answer": null}`;
+              // No tool left to suggest — write a draft answering the user's
+              // latest message (covers conversational turns AND "all tools done").
+              skeleton = `{"thought": "I will write my final answer now.", "tool_name": null, "tool_arguments": {}, "draft_answer": "<write a clear, full-sentence answer to the user's latest message here>", "critique": "APPROVED. The draft directly answers the user's latest message.", "final_answer": "<same as draft_answer>"}`;
             }
             console.log(
               "❌ Harness Error: Model produced no answer and is stuck. Sending a concrete JSON skeleton.",
@@ -479,7 +502,7 @@ async function runHarness() {
               content: `You did NOT set a "draft_answer"/"final_answer" (and called no tool) — so nothing happened. You are stuck.\n\nSTOP thinking. OUTPUT EXACTLY this JSON (fill in any [bracketed] placeholders with real values, then send it):\n\n${skeleton}`,
             });
           } else {
-            // First/second miss: be directive about the exact next tool.
+            // First/second miss: be directive about the exact next step.
             console.log("❌ Harness Error: Model didn't take any action!");
             const directive = needed
               ? `You MUST call the "${needed.name}" tool right now${
@@ -487,7 +510,7 @@ async function runHarness() {
                     ? ` with these arguments: ${JSON.stringify(needed.args)}`
                     : ""
                 }.`
-              : `You MUST either set a "tool_name" to call a tool, OR write a "draft_answer". Pick one.`;
+              : `You have no remaining tool to call. You MUST write a "draft_answer" that directly answers the user's latest message.`;
             messages.push({
               role: "user",
               content: `You did not provide a tool_name, draft_answer, or final_answer. ${directive}\n\nRemember the required JSON shape:\n{"thought": "...", "tool_name": "..." or null, "tool_arguments": {...}, "draft_answer": "..." or null, "critique": "..." or null, "final_answer": "..." or null}\n\nOutput the JSON now.`,
