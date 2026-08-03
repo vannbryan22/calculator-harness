@@ -1,4 +1,4 @@
-import { Ollama } from "ollama";
+import OpenAI from "openai";
 import { z } from "zod";
 import { estimateTokens } from "./helpers/estimate-tokens.js";
 import { summarizeHistory } from "./helpers/summarize-history.js";
@@ -11,7 +11,32 @@ import { readFileTool } from "./tools/read-file.js";
 import { AgentSchema } from "./schemas.js";
 import { writeFileTool } from "./tools/write-file.js";
 
-export const ollama = new Ollama({ host: "http://localhost:11434" });
+// Any OpenAI-compatible provider works here. Defaults to DeepSeek; override any
+// of the three via .env to switch providers without a code change (this is the
+// lesson from the Zhipu saga — model catalogs are per-account, so a wrong model
+// name should be a .env edit, not an edit + redeploy).
+//
+//   DeepSeek (default):  LLM_API_KEY=...   LLM_MODEL=deepseek-chat
+//   Zhipu bigmodel PaaS: LLM_API_KEY=...   LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4   LLM_MODEL=glm-4.5-air
+//   Local Ollama (via ): LLM_API_KEY=ollama LLM_BASE_URL=http://localhost:11434/v1   LLM_MODEL=qwen2.5:3b
+export const LLM_BASE_URL =
+  process.env.LLM_BASE_URL ?? "https://api.deepseek.com";
+export const LLM_MODEL = process.env.LLM_MODEL ?? "deepseek-chat";
+const LLM_API_KEY = process.env.LLM_API_KEY;
+
+if (!LLM_API_KEY) {
+  console.error(
+    "ERROR: LLM_API_KEY is not set. Put it in .env (or your shell). Example .env:\n  LLM_API_KEY=your-deepseek-key\n  # optional overrides:\n  # LLM_MODEL=deepseek-chat\n  # LLM_BASE_URL=https://api.deepseek.com\nGet a DeepSeek key from https://platform.deepseek.com",
+  );
+  process.exit(1);
+}
+
+console.log(`[LLM] ${LLM_MODEL} @ ${LLM_BASE_URL}`);
+
+export const llm = new OpenAI({
+  apiKey: LLM_API_KEY,
+  baseURL: LLM_BASE_URL,
+});
 
 const toolRegistry: Tool[] = [
   calculatorTool,
@@ -244,18 +269,23 @@ async function runHarness() {
         }
       }
 
-      const response = await ollama.chat({
-        model: "qwen2.5vl:3b",
+      const stream = await llm.chat.completions.create({
+        model: LLM_MODEL,
         messages: messages as any,
-        format: "json",
+        // GLM follows OpenAI's JSON mode: forces a valid JSON object reply so
+        // the harness's extractJson/parse path keeps working.
+        response_format: { type: "json_object" },
         stream: true,
       });
 
       let rawReply = "";
       process.stdout.write("🤖 Thinking ");
-      for await (const chunk of response) {
-        process.stdout.write(".");
-        rawReply += chunk.message.content;
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta?.content;
+        if (delta) {
+          process.stdout.write(".");
+          rawReply += delta;
+        }
       }
       console.log(" Done!\n");
 
