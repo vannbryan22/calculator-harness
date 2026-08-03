@@ -306,7 +306,14 @@ async function runHarness() {
               }
               messages.push({
                 role: "user",
-                content: `You just called "${selectedTool.name}" again with arguments you've already used${cached !== undefined ? ` and already got the result: ${cached}` : " (a bare number with nothing to compute)"}. Re-running it will not help.\n\nLook at the user's LATEST message and respond to THAT. If you already have every piece of information it needs, STOP calling tools and write a "draft_answer" that directly answers what the user just asked. If it needs genuinely new information, call a tool with DIFFERENT arguments.\n\nOutput the JSON now.`,
+                content:
+                  cached !== undefined
+                    ? `You just called "${selectedTool.name}" again with arguments you've already used, getting the result: ${cached}. Re-running the SAME call will NOT help, and "${cached}" is NOT the answer to the user's latest message — do not echo it.
+
+Look carefully at the user's LATEST message. It is asking for something NEW. If it requires NEW math, call the calculator with a DIFFERENT expression built from the user's new request (for example, if the user says "add X", use an expression like "${cached} + X"). Only if the message genuinely needs no new computation should you write a "draft_answer".
+
+Output the JSON now.`
+                    : `You called the calculator with a bare number (${String(parsed.tool_arguments?.expression ?? "")}), which has nothing to compute. Look at the user's LATEST message: if it needs math, call the calculator with a real EXPRESSION for it; otherwise write a "draft_answer". Output the JSON now.`,
               });
               continue;
             }
@@ -480,6 +487,13 @@ async function runHarness() {
           // "tools already done" through the same path, no word-matching.
           const needed = inferNeededTool(userInput, usedTools);
 
+          // Escalate to a concrete skeleton only when the model is genuinely
+          // stuck: repeating the same thought, or several attempts have failed.
+          // NOTE: we deliberately do NOT escalate on attempt 1. An attempt-1
+          // thought-only response is common and recoverable via the soft nudge
+          // below, which lets the model reason freely about the CURRENT
+          // question. Handing it a prescriptive skeleton too early biases a
+          // small model toward copying old tool arguments from history.
           if (repeating || attempts >= 3) {
             // Escalation: a concrete skeleton the model can copy verbatim.
             let skeleton: string;
